@@ -128,7 +128,7 @@ with st.sidebar:
     start = st.date_input("Start", value=pd.to_datetime("2023-01-01"))
     end = st.date_input("End", value=pd.to_datetime("today"))
     pivot_window = st.slider("Pivot window", 2, 10, value=5)
-    rsi_len = st.slider("RSI length", 5, 50, value=50)
+    rsi_len = st.slider("RSI length", 5, 14, value=14)
     st.markdown("### Select Signals to Display")
     signal_opts = {
         "Bull/Bear Engulfing": "engulf",
