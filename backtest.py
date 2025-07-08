@@ -241,4 +241,4 @@ if run:
             title=f"{ticker} — Selected Signals", xaxis_rangeslider_visible=False, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), height=900,
         )
 
-    st.plotly_chart(fig, use_container
+    st.plotly_chart(fig, use_container)
