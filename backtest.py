@@ -218,7 +218,6 @@ if run:
                 add_marker(s == 1, "Low", *colour_map["rsidiv_buy"])
                 add_marker(s == -1, "High", *colour_map["rsidiv_sell"])
 
-        # RSI subplot -----------------------------------------------------------
         fig.add_trace(
             go.Scatter(x=df.index, y=rsi, mode="lines", name="RSI"),
             row=2,
@@ -241,4 +240,5 @@ if run:
             title=f"{ticker} — Selected Signals", xaxis_rangeslider_visible=False, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), height=900,
         )
 
-    st.plotly_chart(fig, use_container)
+            st.plotly_chart(fig, use_container_width=True)
+
