@@ -173,7 +173,7 @@ if run_btn:
     with st.spinner("Λήψη δεδομένων & εκπαίδευση μοντέλου…"):
         df_raw = get_data(ticker, start="2015-01-01", end=str(end_date))
         if df_raw.empty:
-            st.error("❌ Δεν βρέθηκαν δεδομένα για αυτό το σύμβολο.")
+            st.error("Δεν βρέθηκαν δεδομένα για αυτό το σύμβολο.")
             st.stop()
         df = add_technical_indicators(df_raw)
 
