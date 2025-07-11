@@ -16,7 +16,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
+START_DATE = "2015-01-01"      
+TRAIN_FRAC = 0.8              
+SEED_DEFAULT = 42
+
 def get_data(ticker: str, start: str, end: str) -> pd.DataFrame:
+    """Download OHLCV data and compute daily log‑returns."""
     df = yf.download(
         ticker,
         start=start,
@@ -32,7 +37,9 @@ def get_data(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 def add_technical_indicators(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
     df = df.copy()
+
     df[f"SMA_{win}"] = df["Close"].rolling(win).mean()
+
     delta = df["Close"].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
@@ -56,7 +63,6 @@ def prepare_supervised(
     use_tech: bool = True,
     tech_lags: int = 0,
 ) -> Tuple[pd.DataFrame, pd.Series]:
-    """Return (X, y) for supervised learning."""
     cols_ret = [f"lag_{i}" for i in range(n_lags, 0, -1)]
     X_ret = np.column_stack([df["log_ret"].shift(i) for i in range(1, n_lags + 1)])
     X = pd.DataFrame(X_ret, columns=cols_ret, index=df.index)
@@ -90,9 +96,8 @@ def train_svm(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     n_splits: int = 5,
-    seed: int = 42,
+    seed: int = SEED_DEFAULT,
 ):
-    """Hyper‑parameter search for SVM with a time‑series split."""
     tscv = TimeSeriesSplit(n_splits=n_splits)
     pipe = Pipeline([("scaler", StandardScaler()), ("svr", SVR(kernel="rbf"))])
     param_dist = {
@@ -127,7 +132,6 @@ def simulate_paths(
     n_boot: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Bootstrap future log‑return paths given the trained model."""
     paths = np.empty((n_boot, n_steps))
     lag_idx = np.array([last_row.index.get_loc(c) for c in lag_cols])
     feat0 = last_row.values.astype(float)
@@ -151,26 +155,24 @@ def wilson_ci(k: int, n: int, conf: float):
     half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
     return center - half, center + half
 
-st.set_page_config(page_title="Probabilistic SVM Directional Forecast", layout="wide")
+st.set_page_config(page_title="Probabilistic SVM Direction Forecast", layout="wide")
 st.title("📈 Probabilistic SVM Direction Forecast")
 
 with st.sidebar:
     st.header("Parameters")
 
     ticker = st.text_input("Ticker (Yahoo Finance)", value="ES=F")
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start date", value=pd.to_datetime("2015-01-01"))
-    with col2:
-        end_date = st.date_input("End date", value=pd.to_datetime("2025-07-10"))
+
+    st.markdown(f"**Start date:** `{START_DATE}` (fixed)")
+
+    end_date = st.date_input("End date", value=pd.to_datetime("2025-07-10"))
 
     lags = st.number_input("Lagged returns (n_lags)", min_value=1, max_value=30, value=10)
     use_tech = st.checkbox("Use technical indicators", value=True)
     forecast = st.number_input("Forecast horizon (trading days)", min_value=1, max_value=30, value=5)
     ci = st.slider("Confidence interval", min_value=0.5, max_value=0.99, value=0.9, step=0.01)
     n_boot = st.number_input("Bootstrap paths (n_boot)", min_value=100, max_value=5000, value=1000, step=100)
-    train_frac = st.slider("Train size fraction", min_value=0.5, max_value=0.95, value=0.8, step=0.05)
-    seed = st.number_input("Random seed", min_value=0, max_value=9999, value=42)
+    seed = st.number_input("Random seed", min_value=0, max_value=9999, value=SEED_DEFAULT)
 
     run_btn = st.button("Run model 🚀", type="primary")
 
@@ -181,14 +183,14 @@ def load_and_engineer(ticker: str, start: str, end: str) -> pd.DataFrame:
     return df
 
 if run_btn:
-    if start_date >= end_date:
-        st.error("End date must be after start date.")
+    if pd.to_datetime(START_DATE) >= pd.to_datetime(end_date):
+        st.error("End date must be after 2015‑01‑01.")
     else:
         with st.spinner("Downloading data & training model ..."):
-            df = load_and_engineer(ticker, str(start_date), str(end_date))
+            df = load_and_engineer(ticker, START_DATE, str(end_date))
 
             X, y = prepare_supervised(df, lags, use_tech)
-            split = int(len(X) * train_frac)
+            split = int(len(X) * TRAIN_FRAC)
             X_train, X_test = X.iloc[:split], X.iloc[split:]
             y_train, y_test = y.iloc[:split], y.iloc[split:]
 
@@ -235,8 +237,7 @@ if run_btn:
         buf = io.BytesIO()
         np.save(buf, log_paths)
         buf.seek(0)
-        st.download_button(
-            "⬇️ Download simulated log‑return paths (.npy)",
+        st.download_button("Download ",
             data=buf,
             file_name=f"{ticker.replace('=','')}_log_paths.npy",
         )
@@ -244,4 +245,4 @@ if run_btn:
         st.subheader("Historical price chart (Close)")
         st.line_chart(df["Close"])
 
-        st.success("Done ✅")
+        st.success("Done")
