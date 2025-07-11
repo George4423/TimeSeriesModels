@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-from pathlib import Path
 from typing import Tuple, List
 
 import numpy as np
@@ -16,12 +15,22 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
-START_DATE = "2015-01-01"      
-TRAIN_FRAC = 0.8              
-SEED_DEFAULT = 42
+# ------------------------------------------------------------------
+# Fixed parameters (not exposed to UI)
+# ------------------------------------------------------------------
+START_DATE = "2015-01-01"     # historical start
+TRAIN_FRAC = 0.8              # train/test split
+SEED = 42                     # RNG seed
+N_LAGS = 10                   # lagged log‑returns
+FORECAST = 5                  # forecast horizon (days)
+N_BOOT = 1000                 # bootstrap paths
+
+# ------------------------------------------------------------------
+# Data utilities
+# ------------------------------------------------------------------
 
 def get_data(ticker: str, start: str, end: str) -> pd.DataFrame:
-    """Download OHLCV data and compute daily log‑returns."""
+    """Download OHLCV and compute daily log‑returns."""
     df = yf.download(
         ticker,
         start=start,
@@ -36,18 +45,23 @@ def get_data(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 
 def add_technical_indicators(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
+    """Add SMA, RSI, realised volatility & volume Z‑score."""
     df = df.copy()
 
+    # SMA
     df[f"SMA_{win}"] = df["Close"].rolling(win).mean()
 
+    # RSI
     delta = df["Close"].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
     rs = up.rolling(win).mean() / down.rolling(win).mean()
     df[f"RSI_{win}"] = 100 - (100 / (1 + rs))
 
+    # Realised volatility of log‑returns
     df["vol"] = df["log_ret"].rolling(win).std(ddof=0)
 
+    # Volume Z‑score
     volume_safe = df["Volume"].clip(lower=1)
     log_vol = np.log(volume_safe)
     df["volume_z"] = (
@@ -57,48 +71,31 @@ def add_technical_indicators(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
     return df.dropna()
 
 
-def prepare_supervised(
-    df: pd.DataFrame,
-    n_lags: int = 10,
-    use_tech: bool = True,
-    tech_lags: int = 0,
-) -> Tuple[pd.DataFrame, pd.Series]:
-    cols_ret = [f"lag_{i}" for i in range(n_lags, 0, -1)]
-    X_ret = np.column_stack([df["log_ret"].shift(i) for i in range(1, n_lags + 1)])
+def prepare_supervised(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    """Create supervised dataset with fixed lag structure and tech indicators."""
+    cols_ret = [f"lag_{i}" for i in range(N_LAGS, 0, -1)]
+    X_ret = np.column_stack([df["log_ret"].shift(i) for i in range(1, N_LAGS + 1)])
     X = pd.DataFrame(X_ret, columns=cols_ret, index=df.index)
 
-    if use_tech:
-        ohlc_cols = ["Open"]
-        base_tech_cols = ["SMA_14", "RSI_14", "volume_z"]
-        tech_cols = ohlc_cols + base_tech_cols
-
-        X_tech = df[tech_cols].copy()
-        if tech_lags > 0:
-            lagged = {
-                f"{col}_lag{i}": df[col].shift(i)
-                for col in tech_cols
-                for i in range(1, tech_lags + 1)
-            }
-            X_tech = pd.concat([X_tech, pd.DataFrame(lagged, index=df.index)], axis=1)
-        X = pd.concat([X, X_tech], axis=1)
+    tech_cols = ["Open", "SMA_14", "RSI_14", "volume_z"]
+    X = pd.concat([X, df[tech_cols]], axis=1)
 
     y = df["log_ret"].copy()
     data = pd.concat([X, y], axis=1).dropna()
     data.columns = data.columns.map(str)
     return data.iloc[:, :-1], data["log_ret"]
 
+# ------------------------------------------------------------------
+# Model utilities
+# ------------------------------------------------------------------
 
 def dir_acc(y_true, y_pred):
     return accuracy_score(y_true > 0, y_pred > 0)
 
 
-def train_svm(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    n_splits: int = 5,
-    seed: int = SEED_DEFAULT,
-):
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+def train_svm(X_train: pd.DataFrame, y_train: pd.Series):
+    """Hyper‑parameter search for an RBF‑kernel SVR."""
+    tscv = TimeSeriesSplit(n_splits=5)
     pipe = Pipeline([("scaler", StandardScaler()), ("svr", SVR(kernel="rbf"))])
     param_dist = {
         "svr__C": loguniform(1e-1, 1e3),
@@ -111,7 +108,7 @@ def train_svm(
         n_iter=50,
         cv=tscv,
         scoring=make_scorer(dir_acc, greater_is_better=True),
-        random_state=seed,
+        random_state=SEED,
         n_jobs=-1,
         verbose=0,
     )
@@ -119,26 +116,21 @@ def train_svm(
     return search.best_estimator_, search.best_params_
 
 
-def directional_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return accuracy_score(y_true > 0, y_pred > 0)
-
-
 def simulate_paths(
     model,
     last_row: pd.Series,
     lag_cols: List[str],
     resid: np.ndarray,
-    n_steps: int,
-    n_boot: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    paths = np.empty((n_boot, n_steps))
+    """Bootstrap future log‑return paths using the fitted model."""
+    paths = np.empty((N_BOOT, FORECAST))
     lag_idx = np.array([last_row.index.get_loc(c) for c in lag_cols])
     feat0 = last_row.values.astype(float)
 
-    for b in range(n_boot):
+    for b in range(N_BOOT):
         feat = feat0.copy()
-        for h in range(n_steps):
+        for h in range(FORECAST):
             mu = model.predict(feat.reshape(1, -1))[0]
             eps = rng.choice(resid)
             step = mu + eps
@@ -155,6 +147,10 @@ def wilson_ci(k: int, n: int, conf: float):
     half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
     return center - half, center + half
 
+# ------------------------------------------------------------------
+# Streamlit UI
+# ------------------------------------------------------------------
+
 st.set_page_config(page_title="Probabilistic SVM Direction Forecast", layout="wide")
 st.title("📈 Probabilistic SVM Direction Forecast")
 
@@ -167,15 +163,13 @@ with st.sidebar:
 
     end_date = st.date_input("End date", value=pd.to_datetime("2025-07-10"))
 
-    lags = st.number_input("Lagged returns (n_lags)", min_value=1, max_value=30, value=10)
-    use_tech = st.checkbox("Use technical indicators", value=True)
-    forecast = st.number_input("Forecast horizon (trading days)", min_value=1, max_value=30, value=5)
-    ci = st.slider("Confidence interval", min_value=0.5, max_value=0.99, value=0.9, step=0.01)
-    n_boot = st.number_input("Bootstrap paths (n_boot)", min_value=100, max_value=5000, value=1000, step=100)
-    seed = st.number_input("Random seed", min_value=0, max_value=9999, value=SEED_DEFAULT)
+    ci = st.slider(
+        "Confidence interval", min_value=0.80, max_value=0.99, value=0.90, step=0.01
+    )
 
     run_btn = st.button("Run model 🚀", type="primary")
 
+# Cache data download & feature engineering
 @st.cache_data(show_spinner=False)
 def load_and_engineer(ticker: str, start: str, end: str) -> pd.DataFrame:
     df = get_data(ticker, start, end)
@@ -183,66 +177,70 @@ def load_and_engineer(ticker: str, start: str, end: str) -> pd.DataFrame:
     return df
 
 if run_btn:
-    if pd.to_datetime(START_DATE) >= pd.to_datetime(end_date):
+    if pd.to_datetime(end_date) <= pd.to_datetime(START_DATE):
         st.error("End date must be after 2015‑01‑01.")
-    else:
-        with st.spinner("Downloading data & training model ..."):
-            df = load_and_engineer(ticker, START_DATE, str(end_date))
+        st.stop()
 
-            X, y = prepare_supervised(df, lags, use_tech)
-            split = int(len(X) * TRAIN_FRAC)
-            X_train, X_test = X.iloc[:split], X.iloc[split:]
-            y_train, y_test = y.iloc[:split], y.iloc[split:]
+    with st.spinner("Downloading data & training model ..."):
+        df = load_and_engineer(ticker, START_DATE, str(end_date))
 
-            model, best_params = train_svm(X_train, y_train, seed=seed)
+        X, y = prepare_supervised(df)
+        split = int(len(X) * TRAIN_FRAC)
+        X_train, X_test = X.iloc[:split], X.iloc[split:]
+        y_train, y_test = y.iloc[:split], y.iloc[split:]
 
-            rmse = np.sqrt(mean_squared_error(y_test, model.predict(X_test)))
-            da = directional_accuracy(y_test.values, model.predict(X_test))
+        model, best_params = train_svm(X_train, y_train)
 
-            resid = y_train.values - model.predict(X_train)
-            lag_cols = [c for c in X.columns if c.startswith("lag_")]
-            last_row = X.iloc[-1]
-            rng = np.random.default_rng(seed)
-            log_paths = simulate_paths(
-                model, last_row, lag_cols, resid, forecast, n_boot, rng
-            )
+        rmse = np.sqrt(mean_squared_error(y_test, model.predict(X_test)))
+        da = accuracy_score(y_test > 0, model.predict(X_test) > 0)
 
-            start = (df.index[-1] + BDay(1)).normalize()
-            f_dates = pd.bdate_range(start, periods=forecast)
+        resid = y_train.values - model.predict(X_train)
+        lag_cols = [c for c in X.columns if c.startswith("lag_")]
+        last_row = X.iloc[-1]
+        rng = np.random.default_rng(SEED)
+        log_paths = simulate_paths(model, last_row, lag_cols, resid, rng)
 
-        st.subheader("Model performance on test set")
-        st.metric("RMSE (log‑ret)", f"{rmse:.6f}")
-        st.metric("Directional Accuracy", f"{da:.2%}")
-        st.caption(f"Best hyper‑parameters: {best_params}")
+        start = (df.index[-1] + BDay(1)).normalize()
+        f_dates = pd.bdate_range(start, periods=FORECAST)
 
-        records = []
-        for i, d in enumerate(f_dates):
-            step = log_paths[:, i]
-            k_up = int((step > 0).sum())
-            p_up = k_up / len(step)
-            low, high = wilson_ci(k_up, len(step), ci)
-            records.append({
-                "Date": d.date().isoformat(),
-                "P(up)": p_up,
-                f"CI_low_{int(ci*100)}%": low,
-                f"CI_high_{int(ci*100)}%": high,
-            })
+    # ------------------------------------------------------------------
+    # Display results
+    # ------------------------------------------------------------------
+    st.subheader("Model performance on test set")
+    col1, col2 = st.columns(2)
+    col1.metric("RMSE (log‑ret)", f"{rmse:.6f}")
+    col2.metric("Directional Accuracy", f"{da:.2%}")
+    st.caption(f"Best hyper‑parameters: {best_params}")
 
-        prob_df = pd.DataFrame(records)
-        st.subheader("Probability of positive daily log‑return")
-        st.table(prob_df.set_index("Date"))
+    records = []
+    for i, d in enumerate(f_dates):
+        step = log_paths[:, i]
+        k_up = int((step > 0).sum())
+        p_up = k_up / N_BOOT
+        low, high = wilson_ci(k_up, N_BOOT, ci)
+        records.append({
+            "Date": d.date().isoformat(),
+            "P(up)": p_up,
+            f"CI_low_{int(ci*100)}%": low,
+            f"CI_high_{int(ci*100)}%": high,
+        })
 
-        st.line_chart(prob_df.set_index("Date")["P(up)"])
+    prob_df = pd.DataFrame(records)
+    st.subheader("Probability of positive daily log‑return")
+    st.table(prob_df.set_index("Date"))
+    st.line_chart(prob_df.set_index("Date")["P(up)"])
 
-        buf = io.BytesIO()
-        np.save(buf, log_paths)
-        buf.seek(0)
-        st.download_button("Download ",
-            data=buf,
-            file_name=f"{ticker.replace('=','')}_log_paths.npy",
-        )
+    # Download simulated paths
+    buf = io.BytesIO()
+    np.save(buf, log_paths)
+    buf.seek(0)
+    st.download_button(
+        "⬇️ Download simulated log‑return paths (.npy)",
+        data=buf,
+        file_name=f"{ticker.replace('=','')}_log_paths.npy",
+    )
 
-        st.subheader("Historical price chart (Close)")
-        st.line_chart(df["Close"])
+    # Historical close price chart
+    st.subheader("Historical Close price")
+    st.line_chart(df["Close"])
 
-        st.success("Done")
