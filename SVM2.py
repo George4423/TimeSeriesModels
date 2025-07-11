@@ -15,12 +15,13 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
-START_DATE = "2015-01-01"    
-TRAIN_FRAC = 0.8              
-SEED = 42                     
-N_LAGS = 10                   
-FORECAST = 5                  
-N_BOOT = 1000                
+START_DATE = "2015-01-01"
+TRAIN_FRAC = 0.8
+SEED = 42
+N_LAGS = 10
+FORECAST = 5
+N_BOOT = 1000
+WIN_TECH = 10
 
 def get_data(ticker: str, start: str, end: str) -> pd.DataFrame:
     df = yf.download(
@@ -36,20 +37,16 @@ def get_data(ticker: str, start: str, end: str) -> pd.DataFrame:
     return df.dropna()
 
 
-def add_technical_indicators(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df[f"SMA_{win}"] = df["Close"].rolling(win).mean()
+
+    df[f"SMA_{WIN_TECH}"] = df["Close"].rolling(WIN_TECH).mean()
+
     delta = df["Close"].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    rs = up.rolling(win).mean() / down.rolling(win).mean()
-    df[f"RSI_{win}"] = 100 - (100 / (1 + rs))
-    df["vol"] = df["log_ret"].rolling(win).std(ddof=0)
-    volume_safe = df["Volume"].clip(lower=1)
-    log_vol = np.log(volume_safe)
-    df["volume_z"] = (
-        (log_vol - log_vol.rolling(252).mean()) / log_vol.rolling(252).std(ddof=0)
-    )
+    rs = up.rolling(WIN_TECH).mean() / down.rolling(WIN_TECH).mean()
+    df[f"RSI_{WIN_TECH}"] = 100 - (100 / (1 + rs))
 
     return df.dropna()
 
@@ -59,12 +56,11 @@ def prepare_supervised(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     X_ret = np.column_stack([df["log_ret"].shift(i) for i in range(1, N_LAGS + 1)])
     X = pd.DataFrame(X_ret, columns=cols_ret, index=df.index)
 
-    tech_cols = ["Open", "SMA_14", "RSI_14", "volume_z"]
+    tech_cols = [f"SMA_{WIN_TECH}", f"RSI_{WIN_TECH}"]
     X = pd.concat([X, df[tech_cols]], axis=1)
 
     y = df["log_ret"].copy()
     data = pd.concat([X, y], axis=1).dropna()
-    data.columns = data.columns.map(str)
     return data.iloc[:, :-1], data["log_ret"]
 
 def dir_acc(y_true, y_pred):
@@ -72,6 +68,7 @@ def dir_acc(y_true, y_pred):
 
 
 def train_svm(X_train: pd.DataFrame, y_train: pd.Series):
+    """Hyper‑parameter tuning for RBF‑SVR."""
     tscv = TimeSeriesSplit(n_splits=5)
     pipe = Pipeline([("scaler", StandardScaler()), ("svr", SVR(kernel="rbf"))])
     param_dist = {
@@ -100,6 +97,7 @@ def simulate_paths(
     resid: np.ndarray,
     rng: np.random.Generator,
 ) -> np.ndarray:
+    """Bootstrap future log‑return paths."""
     paths = np.empty((N_BOOT, FORECAST))
     lag_idx = np.array([last_row.index.get_loc(c) for c in lag_cols])
     feat0 = last_row.values.astype(float)
@@ -111,7 +109,7 @@ def simulate_paths(
             eps = rng.choice(resid)
             step = mu + eps
             paths[b, h] = step
-            feat[lag_idx[:-1]] = feat[lag_idx[1:]]
+            feat[lag_idx[:-1]] = feat[lag_idx[1:]]  # roll lags
             feat[lag_idx[-1]] = step
     return paths
 
@@ -124,7 +122,7 @@ def wilson_ci(k: int, n: int, conf: float):
     return center - half, center + half
 
 st.set_page_config(page_title="Probabilistic SVM Direction Forecast", layout="wide")
-st.title("📈 Probabilistic SVM Direction Forecast")
+st.title("Probabilistic SVM Direction Forecast")
 
 with st.sidebar:
     st.header("Parameters")
@@ -152,7 +150,7 @@ if run_btn:
         st.error("End date must be after 2015‑01‑01.")
         st.stop()
 
-    with st.spinner("Downloading data & training model ..."):
+    with st.spinner("Downloading data & training model …"):
         df = load_and_engineer(ticker, START_DATE, str(end_date))
 
         X, y = prepare_supervised(df)
@@ -175,9 +173,9 @@ if run_btn:
         f_dates = pd.bdate_range(start, periods=FORECAST)
 
     st.subheader("Model performance on test set")
-    col1, col2 = st.columns(2)
-    col1.metric("RMSE (log‑ret)", f"{rmse:.6f}")
-    col2.metric("Directional Accuracy", f"{da:.2%}")
+    c1, c2 = st.columns(2)
+    c1.metric("RMSE (log‑ret)", f"{rmse:.6f}")
+    c2.metric("Directional Accuracy", f"{da:.2%}")
     st.caption(f"Best hyper‑parameters: {best_params}")
 
     records = []
