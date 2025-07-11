@@ -15,22 +15,14 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
-# ------------------------------------------------------------------
-# Fixed parameters (not exposed to UI)
-# ------------------------------------------------------------------
-START_DATE = "2015-01-01"     # historical start
-TRAIN_FRAC = 0.8              # train/test split
-SEED = 42                     # RNG seed
-N_LAGS = 10                   # lagged log‑returns
-FORECAST = 5                  # forecast horizon (days)
-N_BOOT = 1000                 # bootstrap paths
-
-# ------------------------------------------------------------------
-# Data utilities
-# ------------------------------------------------------------------
+START_DATE = "2015-01-01"    
+TRAIN_FRAC = 0.8              
+SEED = 42                     
+N_LAGS = 10                   
+FORECAST = 5                  
+N_BOOT = 1000                
 
 def get_data(ticker: str, start: str, end: str) -> pd.DataFrame:
-    """Download OHLCV and compute daily log‑returns."""
     df = yf.download(
         ticker,
         start=start,
@@ -45,23 +37,14 @@ def get_data(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 
 def add_technical_indicators(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
-    """Add SMA, RSI, realised volatility & volume Z‑score."""
     df = df.copy()
-
-    # SMA
     df[f"SMA_{win}"] = df["Close"].rolling(win).mean()
-
-    # RSI
     delta = df["Close"].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
     rs = up.rolling(win).mean() / down.rolling(win).mean()
     df[f"RSI_{win}"] = 100 - (100 / (1 + rs))
-
-    # Realised volatility of log‑returns
     df["vol"] = df["log_ret"].rolling(win).std(ddof=0)
-
-    # Volume Z‑score
     volume_safe = df["Volume"].clip(lower=1)
     log_vol = np.log(volume_safe)
     df["volume_z"] = (
@@ -72,7 +55,6 @@ def add_technical_indicators(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
 
 
 def prepare_supervised(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    """Create supervised dataset with fixed lag structure and tech indicators."""
     cols_ret = [f"lag_{i}" for i in range(N_LAGS, 0, -1)]
     X_ret = np.column_stack([df["log_ret"].shift(i) for i in range(1, N_LAGS + 1)])
     X = pd.DataFrame(X_ret, columns=cols_ret, index=df.index)
@@ -85,16 +67,11 @@ def prepare_supervised(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     data.columns = data.columns.map(str)
     return data.iloc[:, :-1], data["log_ret"]
 
-# ------------------------------------------------------------------
-# Model utilities
-# ------------------------------------------------------------------
-
 def dir_acc(y_true, y_pred):
     return accuracy_score(y_true > 0, y_pred > 0)
 
 
 def train_svm(X_train: pd.DataFrame, y_train: pd.Series):
-    """Hyper‑parameter search for an RBF‑kernel SVR."""
     tscv = TimeSeriesSplit(n_splits=5)
     pipe = Pipeline([("scaler", StandardScaler()), ("svr", SVR(kernel="rbf"))])
     param_dist = {
@@ -123,7 +100,6 @@ def simulate_paths(
     resid: np.ndarray,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Bootstrap future log‑return paths using the fitted model."""
     paths = np.empty((N_BOOT, FORECAST))
     lag_idx = np.array([last_row.index.get_loc(c) for c in lag_cols])
     feat0 = last_row.values.astype(float)
@@ -147,10 +123,6 @@ def wilson_ci(k: int, n: int, conf: float):
     half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
     return center - half, center + half
 
-# ------------------------------------------------------------------
-# Streamlit UI
-# ------------------------------------------------------------------
-
 st.set_page_config(page_title="Probabilistic SVM Direction Forecast", layout="wide")
 st.title("📈 Probabilistic SVM Direction Forecast")
 
@@ -169,7 +141,6 @@ with st.sidebar:
 
     run_btn = st.button("Run model 🚀", type="primary")
 
-# Cache data download & feature engineering
 @st.cache_data(show_spinner=False)
 def load_and_engineer(ticker: str, start: str, end: str) -> pd.DataFrame:
     df = get_data(ticker, start, end)
@@ -203,9 +174,6 @@ if run_btn:
         start = (df.index[-1] + BDay(1)).normalize()
         f_dates = pd.bdate_range(start, periods=FORECAST)
 
-    # ------------------------------------------------------------------
-    # Display results
-    # ------------------------------------------------------------------
     st.subheader("Model performance on test set")
     col1, col2 = st.columns(2)
     col1.metric("RMSE (log‑ret)", f"{rmse:.6f}")
@@ -230,17 +198,14 @@ if run_btn:
     st.table(prob_df.set_index("Date"))
     st.line_chart(prob_df.set_index("Date")["P(up)"])
 
-    # Download simulated paths
     buf = io.BytesIO()
     np.save(buf, log_paths)
     buf.seek(0)
     st.download_button(
-        "⬇️ Download simulated log‑return paths (.npy)",
+        "Download simulated log‑return paths (.npy)",
         data=buf,
         file_name=f"{ticker.replace('=','')}_log_paths.npy",
     )
 
-    # Historical close price chart
     st.subheader("Historical Close price")
     st.line_chart(df["Close"])
-
