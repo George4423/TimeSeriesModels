@@ -21,53 +21,46 @@ SEED = 42
 N_LAGS = 10
 FORECAST = 5
 N_BOOT = 1000
-WIN_TECH = 10 
+WIN_TECH = 10
+
+def sanitize(df: pd.DataFrame) -> pd.DataFrame:
+    return df.replace([np.inf, -np.inf], np.nan).dropna()
 
 def get_data(ticker: str, start: str, end: str) -> pd.DataFrame:
-    df = yf.download(
-        ticker,
-        start=start,
-        end=end,
-        progress=False,
-        auto_adjust=False,
-    )["Open High Low Close Volume".split()]
-
-    df.dropna(inplace=True)
+    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)[
+        "Open High Low Close Volume".split()
+    ]
     df["log_ret"] = np.log(df["Close"]).diff()
-    return df.dropna()
+    return sanitize(df)
 
 
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
     df[f"SMA_{WIN_TECH}"] = df["Close"].rolling(WIN_TECH).mean()
-
     delta = df["Close"].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
     rs = up.rolling(WIN_TECH).mean() / down.rolling(WIN_TECH).mean()
     df[f"RSI_{WIN_TECH}"] = 100 - (100 / (1 + rs))
+    return sanitize(df)
 
-    return df.dropna()
 
 def prepare_supervised(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     cols_ret = [f"lag_{i}" for i in range(N_LAGS, 0, -1)]
     X_ret = np.column_stack([df["log_ret"].shift(i) for i in range(1, N_LAGS + 1)])
     X = pd.DataFrame(X_ret, columns=cols_ret, index=df.index)
-
-    tech_cols = [f"SMA_{WIN_TECH}", f"RSI_{WIN_TECH}"]
-    X = pd.concat([X, df[tech_cols]], axis=1)
-
+    X = pd.concat([X, df[[f"SMA_{WIN_TECH}", f"RSI_{WIN_TECH}"]]], axis=1)
     y = df["log_ret"].copy()
-    data = pd.concat([X, y], axis=1).dropna()
-    return data.iloc[:, :-1], data["log_ret"]
+    return sanitize(pd.concat([X, y], axis=1)).iloc[:, :-1], sanitize(pd.concat([X, y], axis=1))["log_ret"]
 
 def dir_acc(y_true, y_pred):
     return accuracy_score(y_true > 0, y_pred > 0)
 
 
 def train_svm(X_train: pd.DataFrame, y_train: pd.Series):
-    tscv = TimeSeriesSplit(n_splits=5)
+    # adaptive CV splits
+    n_splits = min(5, max(2, len(X_train) // 50))
+    tscv = TimeSeriesSplit(n_splits=n_splits)
     pipe = Pipeline([("scaler", StandardScaler()), ("svr", SVR(kernel="rbf"))])
     param_dist = {
         "svr__C": loguniform(1e-1, 1e3),
@@ -83,10 +76,10 @@ def train_svm(X_train: pd.DataFrame, y_train: pd.Series):
         random_state=SEED,
         n_jobs=-1,
         verbose=0,
+        error_score="raise",
     )
     search.fit(X_train, y_train)
     return search.best_estimator_, search.best_params_
-
 
 def simulate_paths(
     model,
