@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# ─────────────────────────────── imports ──
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -13,6 +14,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
+# ───────────────────────── Streamlit config ──
 st.set_page_config(
     page_title="Probabilistic SVM Forecast",
     page_icon="📈",
@@ -23,21 +25,30 @@ st.set_page_config(
 st.title("📈 Πιθανότητες & τιμές‑στόχοι (SVM)")
 st.markdown(
     """
-    Το μοντέλο εκπαιδεύεται σε ημερήσια δεδομένα από **1 Ιαν 2015** (ή από την
-    πρώτη διαθέσιμη μέρα) και προσομοιώνει 1 000 μονοπάτια λογαριθμικών
-    αποδόσεων για τις επόμενες 5 συνεδριάσεις.
+    Το μοντέλο εκπαιδεύεται σε ημερήσια δεδομένα από **1 Ιαν 2015** και προσομοιώνει
+    1000 μονοπάτια λογαριθμικών αποδόσεων για τις επόμενες 5 συνεδριάσεις.
 
-    Για κάθε μέρα λαμβάνεις:
-    * **P(up)** – πιθανότητα θετικής απόδοσης  
-    * **MinClose / MaxClose** – μικρότερη & μεγαλύτερη τιμή κλεισίματος
-      που εμφανίστηκε στα μονοπάτια
-    * **P(≥ x %)** – πιθανότητα η απόδοση να ξεπεράσει το κατώφλι x  
-    * **Close@x %** – τιμή κλεισίματος που αντιστοιχεί στο κατώφλι x
+    Για κάθε ημέρα εμφανίζονται:
+
+    * **P(up)** – πιθανότητα θετικής απόδοσης  
+    * **MinClose / MaxClose** – ελάχιστο & μέγιστο κλείσιμο από τις προσομοιώσεις  
+    * **P(≥ x %)** – πιθανότητα η απόδοση να ξεπεράσει το κατώφλι x  
+    * **Close@x %** – τιμή κλεισίματος που αντιστοιχεί στο κατώφλι x
     """
 )
 
+# ─────────────────────────── helpers ──
 def get_data(ticker: str, start: str, end: str) -> pd.DataFrame:
-    df = yf.download(ticker, start=start, end=end, progress=False)[["Close"]]
+    """Download data & return single‑level Close + log returns."""
+    raw = yf.download(ticker, start=start, end=end, progress=False)
+
+    # αντιμετώπιση MultiIndex (Close, ticker)
+    if isinstance(raw.columns, pd.MultiIndex):
+        close_series = raw["Close"].iloc[:, 0]   # πρώτο (μοναδικό) ticker
+    else:
+        close_series = raw["Close"]
+
+    df = close_series.to_frame(name="Close")
     df.dropna(inplace=True)
     df["log_ret"] = np.log(df["Close"]).diff()
     return df.dropna()
@@ -124,6 +135,7 @@ def simulate_paths(
             feat[lag_idx[-1]] = mu
     return paths
 
+# ───────────────────────── core routine ──
 def forecast_prob(
     df: pd.DataFrame,
     *,
@@ -147,15 +159,18 @@ def forecast_prob(
     paths = simulate_paths(model, last_row, lag_cols, resid,
                            n_steps=forecast, n_boot=1000)
 
-    last_close = df["Close"].iloc[-1]
+    # safe scalar extraction
+    last_close_raw = df["Close"].iloc[-1]
+    last_close = float(np.asarray(last_close_raw).ravel()[0])
+
     start_date = df.index[-1] + BDay(1)
     pred_dates = pd.bdate_range(start_date, periods=forecast)
 
     result_rows = []
     for i, d in enumerate(pred_dates):
-        step = paths[:, i]                      
-        pct_step = np.exp(step) - 1            
-        price_step = last_close * np.exp(step)  
+        step = paths[:, i]                       # log‑returns
+        pct_step = np.exp(step) - 1              # simple %
+        price_step = last_close * np.exp(step)   # closing prices
 
         row = {
             "date": d.date(),
@@ -170,6 +185,7 @@ def forecast_prob(
 
     return pd.DataFrame(result_rows), rmse, best_params
 
+# ───────────────────────── Streamlit UI ──
 with st.sidebar:
     st.header("Ρυθμίσεις")
     ticker = st.text_input("Ticker", value="MNQ=F")
@@ -185,6 +201,7 @@ if run_btn:
             st.stop()
         df = add_technical_indicators(df_raw)
 
+        # parse thresholds
         try:
             thr_list = [
                 float(x.strip()) / 100
@@ -212,4 +229,3 @@ if run_btn:
 
     st.markdown("—")
     st.caption("© 2025 Probabilistic SVM Demo — μόνο για εκπαιδευτική χρήση")
-
