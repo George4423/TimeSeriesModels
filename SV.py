@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import io
-from typing import Tuple, List
+import warnings
+from datetime import date
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -9,58 +10,98 @@ import streamlit as st
 import yfinance as yf
 from pandas.tseries.offsets import BDay
 from scipy.stats import loguniform, norm, uniform
-from sklearn.metrics import accuracy_score, mean_squared_error, make_scorer
+from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
-START_DATE = "2015-01-01"
-TRAIN_FRAC = 0.8
-SEED = 42
-N_LAGS = 10
-FORECAST = 5
-N_BOOT = 1000
-WIN_TECH = 10
+warnings.filterwarnings("ignore")
 
-def sanitize(df: pd.DataFrame) -> pd.DataFrame:
-    return df.replace([np.inf, -np.inf], np.nan).dropna()
+# ─────────────────────────────── UI CONFIG ────────────────────────────────
+
+st.set_page_config(
+    page_title="Probabilistic SVM Forecast + Volatility",
+    page_icon="📈",
+    layout="centered",
+    initial_sidebar_state="auto",
+)
+
+st.title("📈 Πιθανότητα θετικής απόδοσης & Ημερήσια Μεταβλητότητα (SVM)")
+st.markdown(
+    """
+    Δώσε τον **Ticker** (σύμβολο Yahoo Finance) και ημερομηνία λήξης.
+    Το μοντέλο εκπαιδεύεται σε ημερήσια δεδομένα από **1 Ιανουαρίου 2015**⋯ ή,
+    αν το σύμβολο ξεκίνησε αργότερα, από την πρώτη διαθέσιμη μέρα.
+
+    Το αποτέλεσμα είναι:
+    * η πιθανότητα να κλείσει με **θετική απόδοση** τις επόμενες 5 trading days (με Wilson CI)
+    * η **ημερήσια μεταβλητότητα** (τυπική απόκλιση % μεταβολής τιμής) από 1.000 προσομοιωμένες διαδρομές
+    """
+)
+
+# ──────────────────────── DATA & FEATURE ENGINEERING ───────────────────────
 
 def get_data(ticker: str, start: str, end: str) -> pd.DataFrame:
-    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)[
-        "Open High Low Close Volume".split()
-    ]
+    """Download Adjusted Close & compute log‑returns."""
+    df = yf.download(ticker, start=start, end=end, progress=False)[["Close"]]
+    df.dropna(inplace=True)
     df["log_ret"] = np.log(df["Close"]).diff()
-    return sanitize(df)
+    return df.dropna()
 
 
-def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def add_technical_indicators(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
+    """Add SMA & RSI for the given window."""
     df = df.copy()
-    df[f"SMA_{WIN_TECH}"] = df["Close"].rolling(WIN_TECH).mean()
+    df[f"SMA_{win}"] = df["Close"].rolling(win).mean()
+
     delta = df["Close"].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    rs = up.rolling(WIN_TECH).mean() / down.rolling(WIN_TECH).mean()
-    df[f"RSI_{WIN_TECH}"] = 100 - (100 / (1 + rs))
-    return sanitize(df)
+    rs = up.rolling(win).mean() / down.rolling(win).mean()
+    df[f"RSI_{win}"] = 100 - (100 / (1 + rs))
+    return df.dropna()
 
 
-def prepare_supervised(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    cols_ret = [f"lag_{i}" for i in range(N_LAGS, 0, -1)]
-    X_ret = np.column_stack([df["log_ret"].shift(i) for i in range(1, N_LAGS + 1)])
+# ---------------------------------------------------------------------------
+# -------------------------- SUPERVISED MATRIX ------------------------------
+# ---------------------------------------------------------------------------
+
+def prepare_supervised(
+    df: pd.DataFrame,
+    *,
+    n_lags: int = 10,
+    tech_lags: int = 10,
+):
+    """Return X, y with log‑return lags **and** lagged SMA/RSI (mandatory)."""
+    # 1) log‑return lags
+    cols_ret = [f"lag_{i}" for i in range(n_lags, 0, -1)]
+    X_ret = np.column_stack([df["log_ret"].shift(i) for i in range(1, n_lags + 1)])
     X = pd.DataFrame(X_ret, columns=cols_ret, index=df.index)
-    X = pd.concat([X, df[[f"SMA_{WIN_TECH}", f"RSI_{WIN_TECH}"]]], axis=1)
+
+    # 2) technicals + THEIR lags (fixed to 10)
+    tech_cols = ["SMA_14", "RSI_14"]
+    X_tech = df[tech_cols].copy()
+
+    lagged = {
+        f"{col}_lag{i}": df[col].shift(i)
+        for col in tech_cols
+        for i in range(1, tech_lags + 1)
+    }
+    X_tech = pd.concat([X_tech, pd.DataFrame(lagged, index=df.index)], axis=1)
+
+    # Combine & return
+    X = pd.concat([X, X_tech], axis=1)
     y = df["log_ret"].copy()
-    return sanitize(pd.concat([X, y], axis=1)).iloc[:, :-1], sanitize(pd.concat([X, y], axis=1))["log_ret"]
+    data = pd.concat([X, y], axis=1).dropna()
+    data.columns = data.columns.map(str)
+    return data.iloc[:, :-1], data["log_ret"]
 
-def dir_acc(y_true, y_pred):
-    return accuracy_score(y_true > 0, y_pred > 0)
 
+# ────────────────────────────── MODEL TRAINING ─────────────────────────────
 
-def train_svm(X_train: pd.DataFrame, y_train: pd.Series):
-    # adaptive CV splits
-    n_splits = min(5, max(2, len(X_train) // 50))
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+def train_svm(X_train: pd.DataFrame, y_train: pd.Series, *, seed: int = 42):
+    tscv = TimeSeriesSplit(n_splits=5)
     pipe = Pipeline([("scaler", StandardScaler()), ("svr", SVR(kernel="rbf"))])
     param_dist = {
         "svr__C": loguniform(1e-1, 1e3),
@@ -70,39 +111,18 @@ def train_svm(X_train: pd.DataFrame, y_train: pd.Series):
     search = RandomizedSearchCV(
         pipe,
         param_dist,
-        n_iter=50,
+        n_iter=40,
         cv=tscv,
-        scoring=make_scorer(dir_acc, greater_is_better=True),
-        random_state=SEED,
+        scoring="neg_root_mean_squared_error",
+        random_state=seed,
         n_jobs=-1,
         verbose=0,
-        error_score="raise",
     )
     search.fit(X_train, y_train)
     return search.best_estimator_, search.best_params_
 
-def simulate_paths(
-    model,
-    last_row: pd.Series,
-    lag_cols: List[str],
-    resid: np.ndarray,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    paths = np.empty((N_BOOT, FORECAST))
-    lag_idx = np.array([last_row.index.get_loc(c) for c in lag_cols])
-    feat0 = last_row.values.astype(float)
 
-    for b in range(N_BOOT):
-        feat = feat0.copy()
-        for h in range(FORECAST):
-            mu = model.predict(feat.reshape(1, -1))[0]
-            eps = rng.choice(resid)
-            step = mu + eps
-            paths[b, h] = step
-            feat[lag_idx[:-1]] = feat[lag_idx[1:]]  # roll lags
-            feat[lag_idx[-1]] = step
-    return paths
-
+# ────────────────────────────── UTILITIES ──────────────────────────────────
 
 def wilson_ci(k: int, n: int, conf: float):
     p = k / n
@@ -111,116 +131,119 @@ def wilson_ci(k: int, n: int, conf: float):
     half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
     return center - half, center + half
 
-st.set_page_config(page_title="Probabilistic SVM Direction & Volatility Forecast", layout="wide")
-st.title("📈 Probabilistic SVM – Direction & Volatility")
+
+def simulate_paths(
+    model,
+    last_row: pd.Series,
+    lag_cols: list[str],
+    resid: np.ndarray,
+    *,
+    n_steps: int = 5,
+    n_boot: int = 1000,
+    seed: int = 42,
+):
+    """Bootstrap residuals to create Monte‑Carlo paths of log‑returns."""
+    paths = np.empty((n_boot, n_steps))
+    lag_idx = np.array([last_row.index.get_loc(c) for c in lag_cols])
+    base_feat = last_row.values.astype(float)
+    rng = np.random.default_rng(seed)
+
+    for b in range(n_boot):
+        feat = base_feat.copy()
+        for h in range(n_steps):
+            mu = model.predict(feat.reshape(1, -1))[0]
+            eps = rng.choice(resid)
+            paths[b, h] = mu + eps
+            # Roll the lagged log‑return features 1 step forward
+            feat[lag_idx[:-1]] = feat[lag_idx[1:]]
+            feat[lag_idx[-1]] = mu
+    return paths
+
+
+# ────────────────────────────── FORECASTING ────────────────────────────────
+
+def forecast_prob(df: pd.DataFrame, *, forecast: int = 5, ci: float = 0.9):
+    """Return probability‑/volatility‑table, RMSE & best params."""
+    X, y = prepare_supervised(df, n_lags=10, tech_lags=10)
+
+    split = int(len(X) * 0.8)
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+    model, best_params = train_svm(X_train, y_train)
+    rmse = np.sqrt(mean_squared_error(y_test, model.predict(X_test)))
+
+    # Monte‑Carlo simulation
+    resid = y_train.values - model.predict(X_train)
+    lag_cols = [c for c in X.columns if c.startswith("lag_")]
+    last_row = X.iloc[-1]
+    paths = simulate_paths(model, last_row, lag_cols, resid, n_steps=forecast)
+
+    start_date = df.index[-1] + BDay(1)
+    pred_dates = pd.bdate_range(start_date, periods=forecast)
+
+    result_rows = []
+    for i, d in enumerate(pred_dates):
+        step = paths[:, i]
+        # convert log‑returns to % price change for volatility calc
+        pct_step = np.exp(step) - 1
+        sigma = pct_step.std()
+
+        k_up = int((step > 0).sum())
+        p_up = k_up / len(step)
+        low, high = wilson_ci(k_up, len(step), ci)
+
+        result_rows.append(
+            {
+                "date": d.date(),
+                "P(up)": p_up,
+                f"{int(ci*100)}%_low": low,
+                f"{int(ci*100)}%_high": high,
+                "volatility": sigma,
+            }
+        )
+
+    return pd.DataFrame(result_rows), rmse, best_params
+
+
+# ──────────────────────────── STREAMLIT APP ───────────────────────────────
 
 with st.sidebar:
-    st.header("Parameters")
-    ticker = st.text_input("Ticker (Yahoo Finance)", value="ES=F")
-    st.markdown(f"**Start date:** `{START_DATE}` (fixed)")
-    end_date = st.date_input("End date", value=pd.to_datetime("2025-07-10"))
-    ci = st.slider("Confidence interval", 0.80, 0.99, 0.90, 0.01)
-
-    run_btn = st.button("Run model 🚀", type="primary")
-
-@st.cache_data(show_spinner=False)
-def load_and_engineer(ticker: str, start: str, end: str) -> pd.DataFrame:
-    return add_technical_indicators(get_data(ticker, start, end))
+    st.header("Ρυθμίσεις")
+    ticker = st.text_input("Ticker", value="MNQ=F")
+    end_date = st.date_input("End date", value=date.today())
+    run_btn = st.button("▶️ Run")
+    ci_value = st.slider("Confidence level", 0.80, 0.99, 0.90, 0.01)
 
 if run_btn:
-    if pd.to_datetime(end_date) <= pd.to_datetime(START_DATE):
-        st.error("End date must be after 2015‑01‑01.")
-        st.stop()
+    with st.spinner("Λήψη δεδομένων & εκπαίδευση μοντέλου…"):
+        df_raw = get_data(ticker, start="2015-01-01", end=str(end_date))
+        if df_raw.empty:
+            st.error("Δεν βρέθηκαν δεδομένα για αυτό το σύμβολο.")
+            st.stop()
+        df = add_technical_indicators(df_raw)
 
-    with st.spinner("Downloading data & training model …"):
-        df = load_and_engineer(ticker, START_DATE, str(end_date))
+        results_df, rmse_val, best_params = forecast_prob(df, ci=ci_value)
 
-        X, y = prepare_supervised(df)
-        split = int(len(X) * TRAIN_FRAC)
-        X_train, X_test = X.iloc[:split], X.iloc[split:]
-        y_train, y_test = y.iloc[:split], y.iloc[split:]
+    st.subheader("Αποτελέσματα")
+    st.write(f"Test RMSE (log‑ret): **{rmse_val:.6f}**")
+    with st.expander("Βέλτιστες υπερ‑παράμετροι"):
+        st.json({k: float(v) for k, v in best_params.items()}, expanded=False)
 
-        model, best_params = train_svm(X_train, y_train)
+    # Styling percentages
+    fmt_dict = {
+        "P(up)": "{:.2%}",
+        f"{int(ci_value*100)}%_low": "{:.2%}",
+        f"{int(ci_value*100)}%_high": "{:.2%}",
+        "volatility": "{:.2%}",
+    }
+    st.table(results_df.style.format(fmt_dict))
 
-        y_pred_test = model.predict(X_test)
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred_test))
-        da = accuracy_score(y_test > 0, y_pred_test > 0)
+    # ---- Volatility chart ----
+    st.markdown("### Ημερήσια μεταβλητότητα από προσομοίωση")
+    vol_chart_data = results_df.set_index("date")["volatility"]
+    st.line_chart(vol_chart_data)
 
-        resid = y_train.values - model.predict(X_train)
-        lag_cols = [c for c in X.columns if c.startswith("lag_")]
-        last_row = X.iloc[-1]
-        rng = np.random.default_rng(SEED)
-        log_paths = simulate_paths(model, last_row, lag_cols, resid, rng)
+    st.markdown("—")
+    st.caption("© 2025 Probabilistic SVM Demo — μόνο για εκπαιδευτική χρήση")
 
-        start = (df.index[-1] + BDay(1)).normalize()
-        f_dates = pd.bdate_range(start, periods=FORECAST)
-        last_price = df["Close"].iloc[-1]
-
-    st.subheader("Model performance on test set")
-    m1, m2 = st.columns(2)
-    m1.metric("RMSE (log‑ret)", f"{rmse:.6f}")
-    m2.metric("Directional Accuracy", f"{da:.2%}")
-    st.caption(f"Best hyper‑parameters: {best_params}")
-
-    prob_records, vol_records = [], []
-    cum_log_paths = log_paths.cumsum(axis=1)
-
-    for i, d in enumerate(f_dates):
-        step = log_paths[:, i]
-        k_up = int((step > 0).sum())
-        p_up = k_up / N_BOOT
-        low_ci, high_ci = wilson_ci(k_up, N_BOOT, ci)
-        prob_records.append({
-            "Date": d.date().isoformat(),
-            "P(up)": p_up,
-            f"CI_low_{int(ci*100)}%": low_ci,
-            f"CI_high_{int(ci*100)}%": high_ci,
-        })
-
-        sigma = step.std(ddof=0)
-        cum_step = cum_log_paths[:, i]
-        ret_5, ret_95 = np.percentile(cum_step, [5, 95])
-        price_5 = last_price * np.exp(ret_5)
-        price_95 = last_price * np.exp(ret_95)
-        vol_records.append({
-            "Date": d.date().isoformat(),
-            "σ(log_ret)": sigma,
-            "ret_5%": ret_5,
-            "ret_95%": ret_95,
-            "price_low_5%": price_5,
-            "price_high_95%": price_95,
-        })
-
-    prob_df = pd.DataFrame(prob_records)
-    st.subheader("Probability of positive daily log‑return")
-    st.table(prob_df.set_index("Date"))
-    st.line_chart(prob_df.set_index("Date")["P(up)"])
-
-    vol_df = pd.DataFrame(vol_records).set_index("Date")
-    st.subheader("Forecasted volatility / price range (5‑95 % band)")
-    st.table(vol_df[["σ(log_ret)", "ret_5%", "ret_95%", "price_low_5%", "price_high_95%"]])
-
-    median_price = last_price * np.exp(np.percentile(cum_log_paths, 50, axis=0))
-    p5 = last_price * np.exp(np.percentile(cum_log_paths, 5, axis=0))
-    p95 = last_price * np.exp(np.percentile(cum_log_paths, 95, axis=0))
-
-    fan_df = pd.DataFrame({
-        "median": median_price,
-        "low_5%": p5,
-        "high_95%": p95,
-    }, index=f_dates)
-
-    st.subheader("Fan chart – expected price band (5‑95 %)")
-    st.line_chart(fan_df)
-
-    buf = io.BytesIO()
-    np.save(buf, log_paths)
-    buf.seek(0)
-    st.download_button(
-        "⬇️ Download simulated log‑return paths (.npy)",
-        data=buf,
-        file_name=f"{ticker.replace('=','')}_log_paths.npy",
-    )
-
-    st.subheader("Historical Close price")
-    st.line_chart(df["Close"])
