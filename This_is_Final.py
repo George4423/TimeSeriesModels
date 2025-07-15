@@ -238,6 +238,7 @@ if run_btn:
             thresholds=thr_list,
         )
 
+    
     st.subheader("Αποτελέσματα")
     st.write(
         f"Test RMSE (log‑ret): **{rmse_val:.6f}** &nbsp;&nbsp;|&nbsp;&nbsp;"
@@ -246,7 +247,13 @@ if run_btn:
     with st.expander("Βέλτιστες υπερ‑παράμετροι"):
         st.json({k: float(v) for k, v in best_params.items()}, expanded=False)
 
-    st.table(results_df)
+    # —— ΕΔΩ ΚΑΝΟΥΜΕ ΤΗ ΔΙΟΡΘΩΣΗ ——
+    pct_cols = ["P(up)"] + [c for c in results_df.columns if c.startswith("P≥")]
+    formatter: dict[str, str] = {
+        "P(up)": "{:.2%}",
+        **{c: "{:.2%} ({:.2f})" for c in pct_cols if c != "P(up)"}
+    }
+    st.table(results_df.style.format(formatter))
 
     st.markdown("—")
     st.caption("© 2025 Probabilistic SVM v2 — only for insights and NOT TO TRUST")
