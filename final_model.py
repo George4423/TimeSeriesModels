@@ -90,6 +90,7 @@ def add_technical_indicators(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
 def add_realized_vol(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
     """
     Add Parkinson volatility sqrt-mean and ATR% features.
+    (pandas-native rolling to avoid AttributeErrors)
     """
     df = df.copy()
 
@@ -98,14 +99,15 @@ def add_realized_vol(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
     parkinson_var = (hl ** 2) / (4 * np.log(2))
     df["parkinson_vol"] = parkinson_var.rolling(win).mean().pow(0.5)
 
-    # True Range & ATR%
+    # True Range & ATR% (keep as pandas Series so .rolling works)
     prev_close = df["Close"].shift()
-    tr = np.maximum.reduce([
+    tr_components = pd.concat([
         (df["High"] - df["Low"]).abs(),
         (df["High"] - prev_close).abs(),
-        (df["Low"] - prev_close).abs()
-    ])
-    df["atr_pct"] = (tr.rolling(win).mean() / df["Close"])
+        (df["Low"] - prev_close).abs(),
+    ], axis=1)
+    tr = tr_components.max(axis=1)
+    df["atr_pct"] = tr.rolling(win).mean() / df["Close"]
 
     return df
 
@@ -113,7 +115,7 @@ def add_realized_vol(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
 def add_exogenous_vix(df: pd.DataFrame) -> pd.DataFrame:
     """
     Join VIX and VIX3M features (level, log change, z-score, slope).
-    Forward-fill across business days to align with the main series.
+    Safe if VIX data is missing or partially available.
     """
     start_date = df.index.min().date()
     end_date = (df.index.max() + pd.Timedelta(days=1)).date()
@@ -123,36 +125,51 @@ def add_exogenous_vix(df: pd.DataFrame) -> pd.DataFrame:
         end=end_date,
         progress=False,
         auto_adjust=False,
-    )["Close"]
+    )
+
+    if vix is None or vix.empty:
+        return df
+
+    # If 'Close' level exists (typical), extract it
+    if "Close" in vix:
+        vix = vix["Close"]
 
     # Handle MultiIndex columns (ticker level)
     if isinstance(vix, pd.DataFrame) and isinstance(vix.columns, pd.MultiIndex):
         vix = vix.droplevel(0, axis=1)
 
-    # If single series is returned, convert to DataFrame
     if isinstance(vix, pd.Series):
         vix = vix.to_frame(name="^VIX")
 
+    if vix is None or vix.empty:
+        return df  # no VIX data, skip
+
     rename_map = {}
     for col in vix.columns:
-        if col.upper() in ("^VIX", "VIX"):
+        up = str(col).upper()
+        if up in ("^VIX", "VIX"):
             rename_map[col] = "VIX"
-        elif col.upper() in ("^VIX3M", "VIX3M"):
+        elif up in ("^VIX3M", "VIX3M"):
             rename_map[col] = "VIX3M"
     vix = vix.rename(columns=rename_map)
 
-    # Align on main index and ffill
+    # Align on main index and ffill to handle non-overlapping holidays
     vix = vix.reindex(df.index).ffill()
 
     # Derived features
-    if "VIX" in vix.columns:
+    cols_present = list(vix.columns)
+    if "VIX" in cols_present:
         vix["VIX_logchg"] = np.log(vix["VIX"]).diff()
         vix["VIX_z"] = (vix["VIX"] - vix["VIX"].rolling(252).mean()) / vix["VIX"].rolling(252).std(ddof=0)
-    if "VIX3M" in vix.columns and "VIX" in vix.columns:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            vix["VIX_slope"] = vix["VIX3M"] / vix["VIX"] - 1.0
+        if "VIX3M" in cols_present:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                vix["VIX_slope"] = vix["VIX3M"] / vix["VIX"] - 1.0
+        out = df.join(vix)
+        out = out.dropna(subset=["VIX"])
+        return out
 
-    return df.join(vix).dropna(subset=["VIX"] if "VIX" in vix.columns else None)
+    # If we don't have a VIX column (only VIX3M or something odd), just join whatever we have.
+    return df.join(vix)
 
 
 def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -188,7 +205,7 @@ def prepare_supervised(
     X_ret = np.column_stack([df["log_ret"].shift(i) for i in range(1, n_lags + 1)])
     X = pd.DataFrame(X_ret, columns=[f"lag_{i}" for i in range(n_lags, 0, -1)], index=df.index)
 
-    # Technical columns available at time t
+    # Technical/exogenous columns available at time t
     base_tech_cols = ["SMA_14", "RSI_14", "vol", "volume_z"] if use_tech else []
     extra_cols = extra_cols or []
     cols = [c for c in base_tech_cols + extra_cols if c in df.columns]
@@ -366,11 +383,11 @@ def forecast_prob(
 
     # Build supervised
     extra_cols = []
-    # Add realized vol cols if present
+    # realized vol
     for c in ["parkinson_vol", "atr_pct"]:
         if c in df_feat.columns:
             extra_cols.append(c)
-    # Add VIX feature set if present
+    # VIX set
     for c in ["VIX", "VIX_logchg", "VIX_z", "VIX_slope"]:
         if c in df_feat.columns:
             extra_cols.append(c)
