@@ -17,40 +17,90 @@ from sklearn.svm import SVR
 # Streamlit UI
 # ===========================
 st.set_page_config(
-    page_title="Probabilistic SVM Forecast (v3)",
+    page_title="Probabilistic SVM Forecast (v3.1)",
     page_icon="📈",
     layout="centered",
     initial_sidebar_state="auto",
 )
 
-st.title("📈 Πιθανότητες & τιμές-στόχοι (SVM v3)")
+st.title("📈 Πιθανότητες & τιμές-στόχοι (SVM v3.1)")
 st.markdown(
     """
     Το μοντέλο εκπαιδεύεται σε ημερήσια δεδομένα από **1 Ιαν 2015** και
     προσομοιώνει 1000 μονοπάτια λογαριθμικών αποδόσεων για τις επόμενες *k* συνεδριάσεις.
 
-    **Νέο (v3):**
-    - Στόχος **επόμενης ημέρας** (χωρίς διαρροή χαρακτηριστικών)
-    - Εξωγενή χαρακτηριστικά **VIX / VIX3M** (επίπεδο, αλλαγές, κλίση)
-    - Realized vol: **Parkinson** & **ATR%**
-    - Block-bootstrap υπολοίπων στη προσομοίωση
+    **v3.1 fixes**: σταθεροποίηση OHLCV από yfinance (κατάργηση MultiIndex),
+    ασφαλής υπολογισμός ATR% για να μην σκάει η ανάθεση.
     """
 )
+
+# ===========================
+# Helpers
+# ===========================
+def _flatten_single_ticker_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure columns are a flat Index with ['Open','High','Low','Close','Volume'].
+    yfinance can return a MultiIndex even for a single ticker; we normalize it here.
+    """
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        # Case A: level 0 are fields (Open...); level 1 is the ticker
+        level0 = out.columns.get_level_values(0)
+        level1 = out.columns.get_level_values(1)
+        if all(k in set(level0) for k in ["Open", "High", "Low", "Close", "Volume"]):
+            # If there's exactly one ticker in level 1, drop it
+            if len(pd.Index(level1).unique()) == 1:
+                out.columns = level0
+            else:
+                # Pick the first ticker present
+                first_ticker = pd.Index(level1).unique()[0]
+                out = out.xs(first_ticker, axis=1, level=1)
+        else:
+            # Case B: level 0 might be ticker, level 1 fields; try the inverse
+            if all(k in set(level1) for k in ["Open", "High", "Low", "Close", "Volume"]):
+                if len(pd.Index(level0).unique()) == 1:
+                    out.columns = level1
+                else:
+                    first_ticker = pd.Index(level0).unique()[0]
+                    out = out.xs(first_ticker, axis=1, level=0)
+            else:
+                # Fallback: try to select columns by name regardless of level
+                out = out.loc[:, pd.IndexSlice[:, ["Open", "High", "Low", "Close", "Volume"]]]
+                # If now only one ticker remains, drop the outer level
+                try:
+                    if len(out.columns.get_level_values(0).unique()) == 1:
+                        out.columns = out.columns.get_level_values(1)
+                except Exception:
+                    pass
+
+    # After all that, keep only required cols if they exist
+    wanted = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in out.columns]
+    out = out[wanted]
+    return out
+
 
 # ===========================
 # Data & Feature Engineering
 # ===========================
 def get_data(ticker: str, start: str, end: str) -> pd.DataFrame:
     """
-    Fetch OHLCV and compute log returns.
+    Fetch OHLCV and compute log returns. Columns are flattened to a simple Index.
     """
-    df = yf.download(
+    raw = yf.download(
         ticker,
         start=start,
         end=end,
         progress=False,
         auto_adjust=False,
-    )[["Open", "High", "Low", "Close", "Volume"]]
+    )
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    df = _flatten_single_ticker_ohlcv(raw)
+    # Safety: ensure Series, not DataFrame
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col in df.columns and isinstance(df[col], pd.DataFrame):
+            df[col] = df[col].iloc[:, 0]
 
     df.dropna(inplace=True)
     df["log_ret"] = np.log(df["Close"]).diff()
@@ -64,25 +114,29 @@ def add_technical_indicators(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
     df = df.copy()
 
     # SMA
-    df[f"SMA_{win}"] = df["Close"].rolling(win).mean()
+    if "Close" in df:
+        df[f"SMA_{win}"] = df["Close"].rolling(win).mean()
 
     # RSI
-    delta = df["Close"].diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    rs = up.rolling(win).mean() / down.rolling(win).mean()
-    df[f"RSI_{win}"] = 100 - (100 / (1 + rs))
+    if "Close" in df:
+        delta = df["Close"].diff()
+        up = delta.clip(lower=0)
+        down = -delta.clip(upper=0)
+        rs = up.rolling(win).mean() / down.rolling(win).mean()
+        df[f"RSI_{win}"] = 100 - (100 / (1 + rs))
 
     # Realized volatility of log returns
-    df["vol"] = df["log_ret"].rolling(win).std(ddof=0)
+    if "log_ret" in df:
+        df["vol"] = df["log_ret"].rolling(win).std(ddof=0)
 
     # Volume z-score (log-volume vs 1y mean/std)
-    volume_safe = df["Volume"].clip(lower=1)
-    log_vol = np.log(volume_safe)
-    df["volume_z"] = (
-        (log_vol - log_vol.rolling(252).mean())
-        / log_vol.rolling(252).std(ddof=0)
-    )
+    if "Volume" in df:
+        volume_safe = df["Volume"].clip(lower=1)
+        log_vol = np.log(volume_safe)
+        df["volume_z"] = (
+            (log_vol - log_vol.rolling(252).mean())
+            / log_vol.rolling(252).std(ddof=0)
+        )
 
     return df
 
@@ -90,24 +144,31 @@ def add_technical_indicators(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
 def add_realized_vol(df: pd.DataFrame, win: int = 14) -> pd.DataFrame:
     """
     Add Parkinson volatility sqrt-mean and ATR% features.
-    (pandas-native rolling to avoid AttributeErrors)
+    (pandas-native rolling to avoid assignment errors)
     """
     df = df.copy()
 
     # Parkinson volatility uses High/Low range
-    hl = np.log(df["High"] / df["Low"]).replace([np.inf, -np.inf], np.nan)
-    parkinson_var = (hl ** 2) / (4 * np.log(2))
-    df["parkinson_vol"] = parkinson_var.rolling(win).mean().pow(0.5)
+    if "High" in df and "Low" in df:
+        hl = np.log(df["High"] / df["Low"]).replace([np.inf, -np.inf], np.nan)
+        parkinson_var = (hl ** 2) / (4 * np.log(2))
+        df["parkinson_vol"] = parkinson_var.rolling(win).mean().pow(0.5)
 
-    # True Range & ATR% (keep as pandas Series so .rolling works)
-    prev_close = df["Close"].shift()
-    tr_components = pd.concat([
-        (df["High"] - df["Low"]).abs(),
-        (df["High"] - prev_close).abs(),
-        (df["Low"] - prev_close).abs(),
-    ], axis=1)
-    tr = tr_components.max(axis=1)
-    df["atr_pct"] = tr.rolling(win).mean() / df["Close"]
+    # True Range & ATR% (ensure Series ops)
+    if all(c in df for c in ["High", "Low", "Close"]):
+        prev_close = df["Close"].shift()
+        tr_components = pd.concat([
+            (df["High"] - df["Low"]).abs(),
+            (df["High"] - prev_close).abs(),
+            (df["Low"] - prev_close).abs(),
+        ], axis=1)
+        tr = tr_components.max(axis=1)  # Series
+        atr = tr.rolling(win).mean()    # Series
+        close = df["Close"]
+        # Force both sides to Series to avoid accidental DataFrame ops
+        atr = pd.Series(atr.to_numpy(), index=df.index)
+        close = pd.Series(close.to_numpy(), index=df.index)
+        df["atr_pct"] = atr / close
 
     return df
 
@@ -117,33 +178,39 @@ def add_exogenous_vix(df: pd.DataFrame) -> pd.DataFrame:
     Join VIX and VIX3M features (level, log change, z-score, slope).
     Safe if VIX data is missing or partially available.
     """
+    if df.empty:
+        return df
+
     start_date = df.index.min().date()
     end_date = (df.index.max() + pd.Timedelta(days=1)).date()
-    vix = yf.download(
+    vix_all = yf.download(
         ["^VIX", "^VIX3M"],
         start=start_date,
         end=end_date,
         progress=False,
         auto_adjust=False,
     )
-
-    if vix is None or vix.empty:
+    if vix_all is None or vix_all.empty:
         return df
 
-    # If 'Close' level exists (typical), extract it
+    # Try to grab Close level
+    vix = vix_all
     if "Close" in vix:
         vix = vix["Close"]
 
-    # Handle MultiIndex columns (ticker level)
-    if isinstance(vix, pd.DataFrame) and isinstance(vix.columns, pd.MultiIndex):
-        vix = vix.droplevel(0, axis=1)
+    # Normalize columns to flat Index of tickers
+    if isinstance(vix.columns, pd.MultiIndex):
+        # If level 0 are fields (like 'Close'), we already sliced; now drop remaining level if single
+        if vix.columns.nlevels > 1 and len(vix.columns.get_level_values(-1).unique()) == 1:
+            vix.columns = vix.columns.get_level_values(0)
 
     if isinstance(vix, pd.Series):
         vix = vix.to_frame(name="^VIX")
 
     if vix is None or vix.empty:
-        return df  # no VIX data, skip
+        return df
 
+    # Rename to friendly names
     rename_map = {}
     for col in vix.columns:
         up = str(col).upper()
@@ -153,23 +220,28 @@ def add_exogenous_vix(df: pd.DataFrame) -> pd.DataFrame:
             rename_map[col] = "VIX3M"
     vix = vix.rename(columns=rename_map)
 
-    # Align on main index and ffill to handle non-overlapping holidays
+    # Keep only VIX/VIX3M if present
+    keep = [c for c in ["VIX", "VIX3M"] if c in vix.columns]
+    vix = vix[keep]
+    if vix.empty:
+        return df
+
+    # Align and ffill
     vix = vix.reindex(df.index).ffill()
 
     # Derived features
-    cols_present = list(vix.columns)
-    if "VIX" in cols_present:
+    if "VIX" in vix.columns:
         vix["VIX_logchg"] = np.log(vix["VIX"]).diff()
         vix["VIX_z"] = (vix["VIX"] - vix["VIX"].rolling(252).mean()) / vix["VIX"].rolling(252).std(ddof=0)
-        if "VIX3M" in cols_present:
-            with np.errstate(divide="ignore", invalid="ignore"):
-                vix["VIX_slope"] = vix["VIX3M"] / vix["VIX"] - 1.0
-        out = df.join(vix)
-        out = out.dropna(subset=["VIX"])
-        return out
+    if "VIX" in vix.columns and "VIX3M" in vix.columns:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            vix["VIX_slope"] = vix["VIX3M"] / vix["VIX"] - 1.0
 
-    # If we don't have a VIX column (only VIX3M or something odd), just join whatever we have.
-    return df.join(vix)
+    out = df.join(vix)
+    # Only drop rows missing VIX if VIX exists
+    if "VIX" in vix.columns:
+        out = out.dropna(subset=["VIX"])
+    return out
 
 
 def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -199,7 +271,6 @@ def prepare_supervised(
 ):
     """
     Build features X_t to predict y_{t+1} (next-day log return).
-    This avoids leakage from indicators computed with Close_t into y_t.
     """
     # Lagged log returns (t-1 ... t-n)
     X_ret = np.column_stack([df["log_ret"].shift(i) for i in range(1, n_lags + 1)])
@@ -236,11 +307,9 @@ def dir_acc(y_true, y_pred):
     return accuracy_score(y_true > 0, y_pred > 0)
 
 def rmse_neg(y_true, y_pred):
-    # negative RMSE for "maximize" scorers
     return -np.sqrt(mean_squared_error(y_true, y_pred))
 
 def combo_scorer(y_true, y_pred):
-    # Simple blend: maximize DA, penalize RMSE
     da = accuracy_score(y_true > 0, y_pred > 0)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     return da - 0.5 * rmse
@@ -383,16 +452,13 @@ def forecast_prob(
 
     # Build supervised
     extra_cols = []
-    # realized vol
-    for c in ["parkinson_vol", "atr_pct"]:
+    for c in ["parkinson_vol", "atr_pct"]:  # realized vol
         if c in df_feat.columns:
             extra_cols.append(c)
-    # VIX set
-    for c in ["VIX", "VIX_logchg", "VIX_z", "VIX_slope"]:
+    for c in ["VIX", "VIX_logchg", "VIX_z", "VIX_slope"]:  # VIX set
         if c in df_feat.columns:
             extra_cols.append(c)
-    # Calendar
-    for c in ["dow_sin", "dow_cos", "month_sin", "month_cos"]:
+    for c in ["dow_sin", "dow_cos", "month_sin", "month_cos"]:  # calendar
         if c in df_feat.columns:
             extra_cols.append(c)
 
@@ -572,5 +638,4 @@ if run_btn:
     st.table(results_df.style.format(fmt))
 
     st.markdown("—")
-    st.caption("© 2025 Probabilistic SVM v3 — only for insights and **NOT investment advice**")
-
+    st.caption("© 2025 Probabilistic SVM v3.1 — only for insights and **NOT investment advice**")
